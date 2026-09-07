@@ -1,0 +1,3 @@
+[submodule "isaacgymenvs"]
+	path = isaacgymenvs
+	url = git@github.com:nmarticorena/IsaacGymEnvs.git
