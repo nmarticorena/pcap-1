@@ -1,0 +1,73 @@
+name: Sim2RealFrankaTreeTactileVoxelReach
+
+physics_engine: ${..physics_engine}
+
+env:
+  numEnvs: ${resolve_default:2048,${...num_envs}}
+  envSpacing: 1.5
+  episodeLength: 800
+
+  clipObservations: 5.0
+  clipActions: 1.0
+
+  startPositionNoise: 0.0
+  startRotationNoise: 0.0
+
+  numProps: 16
+  aggregateMode: 3
+
+  actionScale: 10.0
+  dofVelocityScale: 0.1
+  distRewardScale: 2.0
+  rotRewardScale: 0.5
+  aroundHandleRewardScale: 0.25
+  openRewardScale: 7.5
+  fingerDistRewardScale: 5.0
+  actionPenaltyScale: 0.01
+  collisionRewardScale: 0.01
+
+  asset:
+    commonAssetRoot: "source/common/assets"
+    assetFileNameFranka: "urdf/franka_description/robots/franka_panda.urdf"
+    trainLsystemAssetRoot: "source/simulation/lsystems1/three/urdf/tree/gen/randomised/train/"
+    testLsystemAssetRoot: "source/simulation/lsystems1/three/urdf/tree/gen/randomised/test/"
+    assetFileNameTree: "ta_{r_idx}/ternary_a.urdf"
+
+  storeTrgTorques: False
+  maxTrgTorquesToStore: 1000
+  enableJointTorqueObs: True
+  collisionPenalty: 1
+  enableEvalVoxelFile: False
+  numEvaluationTargets: 60
+  brushPastNormContactForce: 40
+  contactForceNoiseStd: 1.0
+  transferableToReal: False
+  dynamicsByBeamDeflection: False
+  randomiseRobotStartPose: False
+  enableSymmetryAwareness: False
+  testTreeUseFileRotation: False
+  enableDebugVis: False
+
+sim:
+  dt: 0.0166
+  substeps: 1
+  up_axis: "z"
+  use_gpu_pipeline: ${eq:${...pipeline},"gpu"}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:"cuda",${....sim_device}}
+    num_position_iterations: 12
+    num_velocity_iterations: 1
+    contact_offset: 0.005
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1000.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 1048576
+    num_subscenes: ${....num_subscenes}
+    contact_collection: 1
+
+task:
+  randomize: False
