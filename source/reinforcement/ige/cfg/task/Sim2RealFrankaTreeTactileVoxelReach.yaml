@@ -25,6 +25,7 @@ env:
   fingerDistRewardScale: 5.0
   actionPenaltyScale: 0.01
   collisionRewardScale: 0.01
+  disableTrees: False
 
   asset:
     commonAssetRoot: "source/common/assets"
