@@ -15,7 +15,6 @@ from isaacgym import gymtorch, gymapi
 from isaacgymenvs.utils.torch_jit_utils import to_torch, get_axis_params, tensor_clamp, tf_combine
 from isaacgymenvs.tasks.base.vec_task import VecTask
 import time
-import joblib
 from datetime import datetime
 
 spot_path = os.getenv('spot_path')
@@ -64,12 +63,8 @@ if source_dir not in sys.path:
 from common.helpers import futils
 from reinforcement.ige.helpers.rl_helper import arm_random_loc_within_reach
 from reinforcement.ige.helpers import physics_helper, rl_helper
-from reinforcement.ige.real.kinova import robot_interface as rki
 from reinforcement.ige.real.kinova import robot_domain
-from reinforcement.ige.real.kinova.robot_collision_checker import store_frame_lag
 from reinforcement.ige.helpers.domains import SuccTracker, CollisionPenalty
-from reinforcement.ige.real.kinova.classifiers import nnc as nnc
-from reinforcement.ige.real.kinova.classifiers import rfc as rfc
 
 cmd_args = {}
 for arg in sys.argv[1:]:
@@ -82,6 +77,7 @@ num_branches_to_select = 20
 dof_torque_obs_scale = 1.
 
 store_frame_freq = 100  # store trg torques every x frames
+store_frame_lag = 10
 
 
 # To run:  bash $spot_path/source/reinforcement/ige/ige_task_runner.sh task=Sim2RealKinovaTreeTactileVoxelReach
@@ -90,6 +86,22 @@ store_frame_freq = 100  # store trg torques every x frames
 # nomenclature : For eval in real kinova (args test=True +real=True)  for eval in simulation (args test=True)
 # noinspection PyAttributeOutsideInit
 class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
+
+    robot_name = "kinova"
+    robot_asset_key = "assetFileNameKinova"
+    num_policy_dofs = 6
+    robot_default_dof_values = [4.661, 3.493, 1.623, 4.211, 0.909, 1.544]
+    robot_cont_dof_indices = [0, 3, 4, 5]
+    robot_dof_damping_values = [80, 80, 80, 80, 80, 80]
+    robot_dof_friction_values = [1e-2] * 6
+    robot_speed_scale_indices = []
+    hand_body_name = "j2n6s300_end_effector"
+    left_finger_body_name = "j2n6s300_link_finger_1"
+    right_finger_body_name = "j2n6s300_link_finger_3"
+    flip_visual_attachments = False
+    arm_type = ArmType.kinova
+    max_norm_impact_cf = 800
+    supports_real = True
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
         self.cfg = cfg
@@ -140,11 +152,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.up_axis_idx = 2
 
         self.dt = 1 / 60
-        self.kinova_cont_dof_ind = [0, 3, 4, 5]  # indices of dofs with continuous joints,
-
-        # changed observation space to include a few branch locations as well
-        num_obs = 20  # ja (6) + jv (6) + ee-tp (3) + classifier(1) + hand_rot (4)
-        num_acts = 6
+        num_acts = self.num_policy_dofs
+        # joint positions + velocities + target offset + hand rotation + collision indicator
+        num_obs = 2 * num_acts + 8
 
         self.cfg["env"]["numObservations"] = num_obs
         self.cfg["env"]["numActions"] = num_acts
@@ -159,7 +169,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # use voxels from file as test targets. applicable only for inference
         self.enable_eval_voxel_file = self.cfg["env"]["enableEvalVoxelFile"]
+        self.num_eval_targets = self.cfg["env"].get("numEvaluationTargets", 60)
         self.brush_past_norm_cf = self.cfg["env"]["brushPastNormContactForce"]
+        self.contact_force_noise_std = self.cfg["env"].get("contactForceNoiseStd", 1.0)
         self.transferable_to_real = self.cfg["env"]["transferableToReal"]
         self.dynamics_by_beam_deflection = self.cfg["env"]["dynamicsByBeamDeflection"]
         self.randomise_robot_start_pose = self.cfg["env"]["randomiseRobotStartPose"]
@@ -184,8 +196,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # Kinova home pose : ([4.661, 3.493, 1.623, 4.211, 0.909, 1.544]
         # Kinova mean (avg(up,lo)) pose : [0.0000, 3.1416, 3.1416, 0.0000, 0.0000, 0.0000]
         # Kinova upright pose facing the tree: [0.0000, 3.1416, 3.1416, 1.78, 3.1416, 0.0000]
-        self.kinova_default_dof_pos = to_torch([4.661, 3.493, 1.623, 4.211, 0.909, 1.544],
-                                               device=self.device)
+        self.robot_default_dof_pos = to_torch(self.robot_default_dof_values, device=self.device)
 
         self.eval_dir = _tactile_real_dir if self.real else _tactile_test_dir
 
@@ -201,7 +212,19 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.init_sim_attrs()  # invoke in case of train & test in sim
 
         # self.loaded_classifier_model = torch.load(trained_classifier_path).to(self.device) # for NN
-        self.loaded_classifier_model = joblib.load(trained_classifier_path)  # for RF
+        if self.real:
+            global rki
+            from reinforcement.ige.real.kinova import robot_interface as rki
+            import joblib
+            self.loaded_classifier_model = joblib.load(trained_classifier_path)
+        else:
+            self.loaded_classifier_model = None
+
+        self.episode_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.train_successes = 0
+        self.train_episodes = 0
+        self.report_successes = 0
+        self.report_episodes = 0
 
         if self._arg_monitor_metric:
             assert (self.test or self.real), "no monitors during training."
@@ -210,7 +233,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.jm_monitor = robot_domain.JointMetricMonitor(
                 device=self.device,
                 check_point=checkpoint_dir,
-                num_robot_dofs=self.num_robot_dofs,
+                num_robot_dofs=self.num_policy_dofs,
                 run_type=run_type)
 
     def init_real_kinova_attrs(self):
@@ -318,6 +341,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
     def validate_settings(self):
 
+        if self.real and not self.supports_real:
+            raise ValueError(f"Real execution is not implemented for {self.robot_name}")
+
         if self.real:
             assert self._arg_headless is True, "In real turnoff graphics, else the frequencies will mess up"
             assert self.transferable_to_real is True, "This policy was not trained to be transferable."
@@ -349,6 +375,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             print("===== Warning:Joint Torques/ Collision information are being stored/replaced locally. =====")
 
         if not self.real:
+            assert 0 < self.num_policy_dofs <= self.num_robot_dofs, "Policy DOFs must be robot DOFs"
             all_num_branches = [self.gym.get_asset_rigid_body_count(ta) for ta in self.tree_assets]
             all_num_tree_dofs = [self.gym.get_asset_dof_count(ta) for ta in self.tree_assets]
 
@@ -426,7 +453,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         assert "asset" in self.cfg["env"]
         common_asset_root = os.path.join(f"{spot_path}", self.cfg["env"]["asset"].get("commonAssetRoot"))
-        kinova_asset_file = self.cfg["env"]["asset"].get("assetFileNameKinova")
+        robot_asset_file = self.cfg["env"]["asset"].get(self.robot_asset_key)
 
         train_lsystem_asset_root = os.path.join(f"{spot_path}", self.cfg["env"]["asset"].get("trainLsystemAssetRoot"))
         test_lsystem_asset_root = os.path.join(f"{spot_path}", self.cfg["env"]["asset"].get("testLsystemAssetRoot"))
@@ -443,10 +470,10 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         else:
             raise ValueError("Run tree_base_rotation_calculator.py to compute the optimal rotation first.")
 
-        self.num_tree_types = futils.count_sub_folders(lsystem_asset_root)
+        self.num_tree_types = min(futils.count_sub_folders(lsystem_asset_root), self.num_envs)
         # repeat excluding 0 like [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
         repeated_file_indices = [j % self.num_tree_types for j in range(self.num_envs)]
-        assert len(tree_alignment_quats) == self.num_tree_types, "invalid alignment information"
+        assert len(tree_alignment_quats) >= self.num_tree_types, "invalid alignment information"
         rep_tree_alignment_quats = [tree_alignment_quats[rep_idx] for rep_idx in repeated_file_indices]
 
         assert self.num_envs >= self.num_tree_types >= 1, "Invalid value: num_tree_types"
@@ -458,13 +485,14 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # load robot asset (franka/kinova)
         asset_options = gymapi.AssetOptions()
+        asset_options.flip_visual_attachments = self.flip_visual_attachments
         asset_options.fix_base_link = True
         asset_options.disable_gravity = True
         asset_options.thickness = 0.001
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_VEL  # switch to velocity control
         asset_options.use_mesh_materials = True
         # robot should be the first asset to be loaded. Changing the order will f*** up the indices.
-        kinova_asset = self.gym.load_asset(self.sim, common_asset_root, kinova_asset_file, asset_options)
+        robot_asset = self.gym.load_asset(self.sim, common_asset_root, robot_asset_file, asset_options)
 
         # load tree asset
         tree_asset_options = gymapi.AssetOptions()
@@ -489,18 +517,19 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # Non-zero stiffness for DOF_MODE_POS
         # kinova_dof_stiffness = to_torch([400, 400, 400, 400, 400, 400], dtype=torch.float,  device=self.device)
         # 0 stiffness for DOF_MODE_VEL
-        kinova_dof_stiffness = to_torch([0, 0, 0, 0, 0, 0], dtype=torch.float, device=self.device)
+        robot_dof_stiffness = torch.zeros(len(self.robot_default_dof_values), dtype=torch.float, device=self.device)
 
-        kinova_dof_damping = to_torch([80, 80, 80, 80, 80, 80], dtype=torch.float, device=self.device)
+        robot_dof_damping = to_torch(self.robot_dof_damping_values, dtype=torch.float, device=self.device)
         # kinova_dof_damping = to_torch([0.2, 0.2, 0.2, 0.2, 0.2, 0.2], dtype=torch.float, device=self.device)
         # kinova_dof_damping = to_torch([2., 2., 2., 2., 2., 2.], dtype=torch.float, device=self.device)
         # kinova_dof_damping = to_torch([200., 200., 200., 200., 200., 200.], dtype=torch.float, device=self.device)
 
-        kinova_dof_friction = to_torch([1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2], dtype=torch.float,
-                                       device=self.device)
+        robot_dof_friction = to_torch(self.robot_dof_friction_values, dtype=torch.float, device=self.device)
 
-        self.num_robot_bodies = self.gym.get_asset_rigid_body_count(kinova_asset)
-        self.num_robot_dofs = self.gym.get_asset_dof_count(kinova_asset)
+        self.num_robot_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
+        self.num_robot_dofs = self.gym.get_asset_dof_count(robot_asset)
+        if self.num_robot_dofs != len(self.robot_default_dof_values):
+            raise ValueError(f"Expected {len(self.robot_default_dof_values)} {self.robot_name} DOFs, got {self.num_robot_dofs}")
         self.num_branches = self.gym.get_asset_rigid_body_count(self.tree_assets[0])
         self.num_tree_dofs = self.gym.get_asset_dof_count(self.tree_assets[0])
 
@@ -514,7 +543,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         print("DR Tree Types: ", self.num_tree_types)
 
         # set robot dof properties
-        robot_dof_props = self.gym.get_asset_dof_properties(kinova_asset)
+        robot_dof_props = self.gym.get_asset_dof_properties(robot_asset)
         self.robot_dof_pos_lower_limits = []
         self.robot_dof_pos_upper_limits = []
         self.robot_dof_vel_max_limits = []
@@ -523,9 +552,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             # DOF_MODE_POS/DOF_MODE_VEL is used for position/velocity control
             robot_dof_props['driveMode'][i] = gymapi.DOF_MODE_VEL  # switch to velocity control
             if self.physics_engine == gymapi.SIM_PHYSX:
-                robot_dof_props['stiffness'][i] = kinova_dof_stiffness[i]
-                robot_dof_props['damping'][i] = kinova_dof_damping[i]
-                robot_dof_props['friction'][i] = kinova_dof_friction[i]
+                robot_dof_props['stiffness'][i] = robot_dof_stiffness[i]
+                robot_dof_props['damping'][i] = robot_dof_damping[i]
+                robot_dof_props['friction'][i] = robot_dof_friction[i]
             else:
                 raise ValueError("Not yet Implemented.")
 
@@ -548,8 +577,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # for continuous joints in Kinova the limit values are too high -3.4028e+38 to 3.4028e+38, preventing ops
         # so make it smaller to reduce freedom. 360d = one full rotation to either side.
-        self.robot_dof_pos_lower_limits[self.kinova_cont_dof_ind] = -1 * math.radians(360)
-        self.robot_dof_pos_upper_limits[self.kinova_cont_dof_ind] = math.radians(360)
+        if self.robot_cont_dof_indices:
+            self.robot_dof_pos_lower_limits[self.robot_cont_dof_indices] = -1 * math.radians(360)
+            self.robot_dof_pos_upper_limits[self.robot_cont_dof_indices] = math.radians(360)
 
         print(f"Robot dof lower limits : {self.robot_dof_pos_lower_limits}")
         print(f"Robot dof upper limits : {self.robot_dof_pos_upper_limits}")
@@ -562,6 +592,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         print(f"enableSymmetryAwareness ? : {self.enable_symmetry_awareness}")
 
         self.robot_dof_speed_scales = torch.ones_like(self.robot_dof_pos_lower_limits)
+        if self.robot_speed_scale_indices:
+            self.robot_dof_speed_scales[self.robot_speed_scale_indices] = 0.1
 
         # create voxel assets, just an empty space indicator
         voxel_opts = gymapi.AssetOptions()
@@ -572,8 +604,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         voxel_asset = self.gym.create_sphere(self.sim, self.voxel_size, voxel_opts)
 
         # compute aggregate size
-        num_robot_bodies = self.gym.get_asset_rigid_body_count(kinova_asset)
-        num_robot_shapes = self.gym.get_asset_rigid_shape_count(kinova_asset)
+        num_robot_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
+        num_robot_shapes = self.gym.get_asset_rigid_shape_count(robot_asset)
 
         num_tree_bodies = self.gym.get_asset_rigid_body_count(self.tree_assets[0])
         num_tree_shapes = self.gym.get_asset_rigid_shape_count(self.tree_assets[0])
@@ -624,7 +656,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             # So in the below case the robot and the tree will collide, but neither will collide with voxel.
             # enable self collisions in the robot with the final 0.
 
-            robot_actor = self.gym.create_actor(env_ptr, kinova_asset, self.robot_start_pose, "kinova", i, 0)
+            robot_actor = self.gym.create_actor(env_ptr, robot_asset, self.robot_start_pose, self.robot_name, i, 0)
             self.gym.set_actor_dof_properties(env_ptr, robot_actor, robot_dof_props)
 
             if self.aggregate_mode == 2:
@@ -658,7 +690,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
             # randomly generate a location to place the target voxel
             voxel_random_pose = arm_random_loc_within_reach(arm_base_pose=self.robot_start_pose,
-                                                            arm_type=ArmType.kinova)
+                                                            arm_type=self.arm_type)
 
             # use a different collision group for voxel to avoid interaction b/w voxel & (tree/robot)
             voxel_actor = self.gym.create_actor(env_ptr, voxel_asset, voxel_random_pose,
@@ -705,11 +737,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                 print(f"Tree {env_i} damping:", sorted(list({*tree_dof_props['damping']})))
                 print(f"Tree {env_i} friction:", sorted(list({*tree_dof_props['friction']})))
 
-        self.hand_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, "j2n6s300_end_effector")
+        self.hand_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, self.hand_body_name)
 
         # j2n6s300_link_finger_1 is the thumb
-        self.lfinger_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, "j2n6s300_link_finger_1")
-        self.rfinger_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, "j2n6s300_link_finger_3")
+        self.lfinger_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, self.left_finger_body_name)
+        self.rfinger_handle = self.gym.find_actor_rigid_body_handle(env_ptr, robot_actor, self.right_finger_body_name)
         self.voxel_handle = self.gym.find_actor_rigid_body_handle(env_ptr, voxel_actor, "box")
         self.tree_root_handle = self.gym.find_actor_rigid_body_handle(env_ptr, tree_actor, "world")
 
@@ -792,9 +824,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
     def init_sim_data(self):
 
         # j2n6s300_link_finger_1 is the thumb
-        hand = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], "j2n6s300_end_effector")
-        lfinger = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], "j2n6s300_link_finger_1")
-        rfinger = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], "j2n6s300_link_finger_3")
+        hand = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], self.hand_body_name)
+        lfinger = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], self.left_finger_body_name)
+        rfinger = self.gym.find_actor_rigid_body_handle(self.envs[0], self.robots[0], self.right_finger_body_name)
 
         # get_rigid_transform: Vectorized bindings to get rigid body transforms in the env frame.
         # different from rigid body states.
@@ -845,7 +877,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                                                robot_local_grasp_pose.r.z, robot_local_grasp_pose.r.w],
                                               device=self.device).repeat((self.num_envs, 1))
 
-        if not self.test and not self.real:
+        if self.supports_real and not self.test and not self.real:
             # store the fixed local grasps for a single environment
             print("self.robot_local_grasp_pos:", self.robot_local_grasp_pos)
             print("self.robot_local_grasp_rot:", self.robot_local_grasp_rot)
@@ -884,10 +916,34 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # The buffers are looked up by the .base.vec_task.py to do the PPO
 
         self.rew_buf[:], self.reset_buf[:], is_real_succ, is_test_succ = compute_robot_reward(
-            self.reset_buf, self.progress_buf, self.actions, self.robot_grasp_pos, self.dist_reward_scale,
+            self.reset_buf, self.progress_buf, self.robot_dof_vel[:, :self.num_policy_dofs],
+            self.robot_grasp_pos, self.dist_reward_scale,
             self.action_penalty_scale, self.max_episode_length, self.voxel_pos, self.robot_net_cf,
             self.collision_reward_scale, self.num_envs, self.collision_penalty_type, self.voxel_size,
             self.test, self.real, self.pred_collision_prob, self.non_subst_collisions_yn, self.rupture_collisions_yn)
+
+        if not self.test and not self.real:
+            reached_target = torch.norm(self.robot_grasp_pos - self.voxel_pos, p=2, dim=-1) < self.voxel_size / 2
+            self.episode_success |= reached_target
+            finished = self.reset_buf.bool()
+            if finished.any():
+                completed_episodes = int(finished.sum().item())
+                completed_successes = int(self.episode_success[finished].sum().item())
+                self.train_episodes += completed_episodes
+                self.train_successes += completed_successes
+                self.report_episodes += completed_episodes
+                self.report_successes += completed_successes
+                self.episode_success[finished] = False
+
+                cumulative_sr = self.train_successes / self.train_episodes
+                self.extras["success_rate"] = torch.tensor(cumulative_sr, device=self.device)
+
+                if self.report_episodes >= self.num_envs:
+                    interval_sr = self.report_successes / self.report_episodes
+                    print(f"Training SR: {interval_sr:.2%} over {self.report_episodes} episodes "
+                          f"(cumulative: {cumulative_sr:.2%} over {self.train_episodes})")
+                    self.report_successes = 0
+                    self.report_episodes = 0
 
         # not really sure whh the > 10, to avoid cases where when no of steps = 0, reach is succ, guess from prev cycle.
         if self.test and self.test_steps_to_succ == self.max_episode_length and self.progress_buf[
@@ -960,8 +1016,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
     def apply_sim_classifier_proxy(self):
         """compute collision prob using a simulation proxy classifier. Computed directly from contact forces"""
 
+        contact_forces = self.robot_net_cf
+        if not self.test and self.contact_force_noise_std > 0:
+            contact_forces = contact_forces + self.contact_force_noise_std * torch.randn_like(contact_forces)
+
         # magnitude of net contact force
-        norm_coll_impact = torch.norm(self.robot_net_cf.view(self.num_envs, -1), p=2, dim=1)
+        norm_coll_impact = torch.norm(contact_forces.view(self.num_envs, -1), p=2, dim=1)
         # A norm value of 20 = 3 newtons on all 16 links. Similarly 3N=> 20, 4N=>27, 5N=34
         self.non_subst_collisions_yn = norm_coll_impact < self.brush_past_norm_cf
 
@@ -969,11 +1029,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.rupture_collisions_yn = norm_coll_impact > 2.0 * self.brush_past_norm_cf
 
         # make a proxy real collision prob
-        max_norm_impact_cf = 800  # This value should be around the 99th %ile; only for sim
-        self.pred_collision_prob = norm_coll_impact / max_norm_impact_cf
+        self.pred_collision_prob = norm_coll_impact / self.max_norm_impact_cf
 
     def apply_real_classifier(self):
         """compute collision prob using real classifier. """
+
+        from reinforcement.ige.real.kinova.classifiers import rfc
 
         self.pred_collision_prob, _ = rki.real_collision_prob(loaded_model=self.loaded_classifier_model,
                                                               curr_dof_torque_mem=self.curr_dof_torque_mem,
@@ -1010,7 +1071,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # use the current observation to decide the next vs the last desired state.
         # for real kinova this seems to be moe ideal.
-        self.robot_dof_vel_targets[:, :self.num_robot_dofs] = self.robot_dof_vel.detach().clone()
+        self.robot_dof_vel_targets[:, :self.num_policy_dofs] = \
+            self.robot_dof_vel[:, :self.num_policy_dofs].detach().clone()
+        self.robot_dof_vel_targets[:, self.num_policy_dofs:self.num_robot_dofs] = 0
 
         # create dof torque mem store for future
         dof_torque_t = self.robot_dof_torques.detach().clone()
@@ -1019,18 +1082,22 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.curr_obs_vel_recent_mem = self.robot_dof_vel.detach().clone()  # for the classifier.
 
         # The observation space is composed of the robot joints’ normalized positions in the interval
-        dof_pos_scaled = (2.0 * (self.robot_dof_pos - self.robot_dof_pos_lower_limits)
-                          / (self.robot_dof_pos_upper_limits - self.robot_dof_pos_lower_limits) - 1.0)
+        dof_pos_scaled = (2.0 * (self.robot_dof_pos[:, :self.num_policy_dofs]
+                                - self.robot_dof_pos_lower_limits[:self.num_policy_dofs])
+                          / (self.robot_dof_pos_upper_limits[:self.num_policy_dofs]
+                             - self.robot_dof_pos_lower_limits[:self.num_policy_dofs]) - 1.0)
 
         to_voxel_target = self.voxel_pos - self.robot_grasp_pos
 
         if self._arg_monitor_metric:
-            self.jm_monitor.append(jp=dof_pos_scaled, jv=self.robot_dof_vel, jt=self.robot_dof_torques)
+            self.jm_monitor.append(jp=dof_pos_scaled,
+                                   jv=self.robot_dof_vel[:, :self.num_policy_dofs],
+                                   jt=self.robot_dof_torques[:, :self.num_policy_dofs])
 
         if self.enable_joint_torque_obs:
             self.apply_real_classifier()  # classify collisions and get prob/yn values
             self.obs_buf = torch.cat((dof_pos_scaled,
-                                      self.robot_dof_vel * self.dof_vel_scale,
+                                      self.robot_dof_vel[:, :self.num_policy_dofs] * self.dof_vel_scale,
                                       to_voxel_target,
                                       hand_rot,
                                       self.non_subst_collisions_yn.detach().clone().float().reshape(self.num_envs, -1)),
@@ -1048,7 +1115,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # use the current observation to decide the next vs the last desired state.
         # for real kinova this seems to be moe ideal; i.e. switch from last desired state to current obs
-        self.robot_dof_vel_targets[:, :self.num_robot_dofs] = self.robot_dof_vel.detach().clone()
+        self.robot_dof_vel_targets[:, :self.num_policy_dofs] = \
+            self.robot_dof_vel[:, :self.num_policy_dofs].detach().clone()
+        self.robot_dof_vel_targets[:, self.num_policy_dofs:self.num_robot_dofs] = 0
 
         # This logic is to reset the environments which returns nan.
         nan_row_env_ids = self.check_for_nans(robot_dof_pos=self.robot_dof_pos,
@@ -1092,14 +1161,18 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.robot_rfinger_rot = self.rigid_body_states[:, self.rfinger_handle][:, 3:7]
 
         # The observation space is composed of the robot joints’ normalized positions in the interval
-        dof_pos_scaled = (2.0 * (self.robot_dof_pos - self.robot_dof_pos_lower_limits)
-                          / (self.robot_dof_pos_upper_limits - self.robot_dof_pos_lower_limits) - 1.0)
+        dof_pos_scaled = (2.0 * (self.robot_dof_pos[:, :self.num_policy_dofs]
+                                - self.robot_dof_pos_lower_limits[:self.num_policy_dofs])
+                          / (self.robot_dof_pos_upper_limits[:self.num_policy_dofs]
+                             - self.robot_dof_pos_lower_limits[:self.num_policy_dofs]) - 1.0)
 
         to_voxel_target = self.voxel_pos - self.robot_grasp_pos
         frame_no = self.gym.get_frame_count(self.sim)
 
         if self._arg_monitor_metric:
-            self.jm_monitor.append(jp=dof_pos_scaled, jv=self.robot_dof_vel, jt=self.robot_dof_torques)
+            self.jm_monitor.append(jp=dof_pos_scaled,
+                                   jv=self.robot_dof_vel[:, :self.num_policy_dofs],
+                                   jt=self.robot_dof_torques[:, :self.num_policy_dofs])
 
         if self.enable_joint_torque_obs:
             _dof_torque_tensors = self.robot_dof_torques.detach().clone()
@@ -1122,7 +1195,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                     # PCAP
                     # =======
                     self.obs_buf = torch.cat((dof_pos_scaled,
-                                              self.robot_dof_vel * self.dof_vel_scale,
+                                              self.robot_dof_vel[:, :self.num_policy_dofs] * self.dof_vel_scale,
                                               to_voxel_target,
                                               hand_rot,
                                               self.non_subst_collisions_yn.detach().clone().float().reshape(
@@ -1152,7 +1225,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                     # Baseline PPO
                     # =====================
                     self.obs_buf = torch.cat((dof_pos_scaled,
-                                              self.robot_dof_vel * self.dof_vel_scale,
+                                              self.robot_dof_vel[:, :self.num_policy_dofs] * self.dof_vel_scale,
                                               to_voxel_target,
                                               hand_rot),
                                              dim=-1)
@@ -1177,7 +1250,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                 self.selected_branch_poses_y_z = self.selected_branch_poses[:, :, 1:3]
 
             # only passing y-z pos of branches.
-            self.obs_buf = torch.cat((dof_pos_scaled, self.robot_dof_vel * self.dof_vel_scale, to_voxel_target,
+            self.obs_buf = torch.cat((dof_pos_scaled,
+                                      self.robot_dof_vel[:, :self.num_policy_dofs] * self.dof_vel_scale, to_voxel_target,
                                       self.selected_branch_poses_y_z.reshape(self.num_envs, -1)),
                                      dim=-1)
 
@@ -1247,8 +1321,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                     pickle.dump(self.eval_succ_tracker.get_counts(), file)
 
             print(self.eval_succ_tracker.get_counts())
+            print(f"Evaluation SR: {self.eval_succ_tracker.get_success_percentage():.2f}% over "
+                  f"{len(self.eval_succ_tracker.succ_status)} targets")
 
-            raise ValueError("all specified target voxel poses executed OR max test frames completed.")
+            print("All evaluation targets completed.")
+            raise SystemExit(0)
 
         if self.real:
             # there is only one pose we execute at a time for real
@@ -1284,6 +1361,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
             if frame_no > init_steps_to_skip:
                 self.track_test_succ(env_ids_int32)  # skip the first reset by using >
+                if not self.enable_eval_voxel_file and len(self.eval_succ_tracker.succ_status) >= self.num_eval_targets:
+                    _finish_test()
 
             for e in env_ids:
                 if self.enable_eval_voxel_file:
@@ -1306,10 +1385,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                           self.root_state_tensor[env_ids, 2, 0:3])
 
                 else:
-                    if frame_no >= 2000:
-                        _finish_test()
+                    self.dof_torques_abs_sum_by_frame.append([])
+                    self.net_cf_abs_sum_by_frame.append([])
+                    self.test_steps_to_succ = self.max_episode_length
                     voxel_rand_pose = arm_random_loc_within_reach(arm_base_pose=self.robot_start_pose,
-                                                                  arm_type=ArmType.kinova)
+                                                                  arm_type=self.arm_type)
                     new_voxel_pose = to_torch([voxel_rand_pose.p.x, voxel_rand_pose.p.y, voxel_rand_pose.p.z])
                     self.root_state_tensor[e, 2, 0:3] = new_voxel_pose
                     print(f"------------ \nResetting voxel pose: {self.collision_penalty_type.name}:",
@@ -1327,12 +1407,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         #  Clamp the generated positions to ensure they are within the specified lower and upper dof limits.
 
         if not self.real:
-            arm_pos = tensor_clamp(
-                self.kinova_default_dof_pos.unsqueeze(0) + 0.25 * (
-                        torch.rand((len(env_ids), self.num_robot_dofs), device=self.device) - 0.5),
-                self.robot_dof_pos_lower_limits, self.robot_dof_pos_upper_limits)
+            arm_pos = self.robot_default_dof_pos.unsqueeze(0).repeat(len(env_ids), 1)
+            arm_pos[:, :self.num_policy_dofs] += 0.25 * (
+                    torch.rand((len(env_ids), self.num_policy_dofs), device=self.device) - 0.5)
+            arm_pos = tensor_clamp(arm_pos, self.robot_dof_pos_lower_limits, self.robot_dof_pos_upper_limits)
 
-            test_arm_pos = self.kinova_default_dof_pos.detach().clone()
+            test_arm_pos = self.robot_default_dof_pos.detach().clone()
 
             #  Update the state of Robot's DOF positions, velocities, and DOF targets for the specified env IDs
             #  with the newly generated positions.
@@ -1381,8 +1461,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         if self.action_attempts == 0:
             self.action_start_time = time.time()
 
-        # pre_physics_step:Actions.shape torch.Size([num_envs, 9])
-        # 9 dof for franka, 6 for kinova
+        # Actions control arm joints only; auxiliary gripper DOFs remain at zero velocity.
         self.actions = actions.clone().to(self.device)
 
         if self.transferable_to_real:
@@ -1398,14 +1477,16 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
            so that you can meet the frequency requirement of Kinova"""
 
         # Note: for dof pos, reduce action_scale, you get shorter strides & less jerky motion
-        delta_vel_target = self.robot_dof_speed_scales * self.dt * self.actions * self.action_scale * (
+        delta_vel_target = self.robot_dof_speed_scales[:self.num_policy_dofs] \
+                           * self.dt * self.actions * self.action_scale * (
                 1 / real_stagger_factor)
 
         for _chunk_idx in range(real_stagger_factor):
-            vel_targets = self.robot_dof_vel_targets[:, :self.num_robot_dofs] + delta_vel_target
+            vel_targets = self.robot_dof_vel_targets[:, :self.num_policy_dofs] + delta_vel_target
 
-            self.robot_dof_vel_targets[:, :self.num_robot_dofs] = tensor_clamp(
-                vel_targets, -1 * self.robot_dof_vel_max_limits, self.robot_dof_vel_max_limits)
+            self.robot_dof_vel_targets[:, :self.num_policy_dofs] = tensor_clamp(
+                vel_targets, -1 * self.robot_dof_vel_max_limits[:self.num_policy_dofs],
+                self.robot_dof_vel_max_limits[:self.num_policy_dofs])
 
             target_dof_vel = self.robot_dof_vel_targets.detach().clone().squeeze(0)
             robot_resp = rki.set_real_robot_dof_vel(target_dof_vel)
@@ -1436,7 +1517,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.action_start_time = time.time()  # re-initialise start time after each time step.
 
         # the commanded velocity for classifier; computed as  sum of targets if all chunks were applied together,
-        self.curr_cmd_vel_recent_mem = self.robot_dof_vel_targets[:, :self.num_robot_dofs].detach().clone()
+        self.curr_cmd_vel_recent_mem = self.robot_dof_vel_targets[:, :self.num_policy_dofs].detach().clone()
 
     def apply_sim_staggered_vel_actions(self, real_write_delay, real_stagger_factor):
         """For sim 2 real for velocity we divide the targets into smaller chunks; therefore stagger sims to ensure that
@@ -1444,13 +1525,15 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         sim_write_delay = real_write_delay * real_stagger_factor
 
-        delta_vel_target = self.robot_dof_speed_scales * self.dt * self.actions * self.action_scale
+        delta_vel_target = self.robot_dof_speed_scales[:self.num_policy_dofs] \
+                           * self.dt * self.actions * self.action_scale
 
-        vel_targets = self.robot_dof_vel_targets[:, :self.num_robot_dofs] + delta_vel_target
+        vel_targets = self.robot_dof_vel_targets[:, :self.num_policy_dofs] + delta_vel_target
 
         # ensure that the robot's DOFs do not move beyond safe or valid ranges
-        self.robot_dof_vel_targets[:, :self.num_robot_dofs] = tensor_clamp(
-            vel_targets, -1 * self.robot_dof_vel_max_limits, self.robot_dof_vel_max_limits)
+        self.robot_dof_vel_targets[:, :self.num_policy_dofs] = tensor_clamp(
+            vel_targets, -1 * self.robot_dof_vel_max_limits[:self.num_policy_dofs],
+            self.robot_dof_vel_max_limits[:self.num_policy_dofs])
 
         self.gym.set_dof_velocity_target_tensor(self.sim, gymtorch.unwrap_tensor(self.robot_dof_vel_targets))
 
@@ -1483,11 +1566,13 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # robot_dof_targets is initially set to 0 with shape (self.num_envs, self.num_dofs)
         vel_targets = self.robot_dof_vel_targets[:,
-                      :self.num_robot_dofs] + self.robot_dof_speed_scales * self.dt * self.actions * self.action_scale
+                      :self.num_policy_dofs] + self.robot_dof_speed_scales[:self.num_policy_dofs] \
+                                               * self.dt * self.actions * self.action_scale
 
         # ensure that the robot's DOFs do not move beyond safe or valid ranges
-        self.robot_dof_vel_targets[:, :self.num_robot_dofs] = tensor_clamp(
-            vel_targets, -1 * self.robot_dof_vel_max_limits, self.robot_dof_vel_max_limits)
+        self.robot_dof_vel_targets[:, :self.num_policy_dofs] = tensor_clamp(
+            vel_targets, -1 * self.robot_dof_vel_max_limits[:self.num_policy_dofs],
+            self.robot_dof_vel_max_limits[:self.num_policy_dofs])
 
         self.gym.set_dof_velocity_target_tensor(self.sim, gymtorch.unwrap_tensor(self.robot_dof_vel_targets))
 
@@ -1524,7 +1609,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 # noinspection PyTypeChecker
 @torch.jit.script
 def compute_robot_reward(
-        reset_buf, progress_buf, actions, robot_grasp_pos, dist_reward_scale, action_penalty_scale,
+        reset_buf, progress_buf, joint_velocities, robot_grasp_pos, dist_reward_scale, action_penalty_scale,
         max_episode_length, voxel_pos, robot_net_cf, collision_reward_scale, num_envs, collision_penalty_type,
         voxel_size, is_test, is_real, pred_collision_prob, non_subst_collisions_yn, rupture_collisions_yn
 ):
@@ -1545,8 +1630,8 @@ def compute_robot_reward(
     voxel_dist_reward = torch.where(d2voxel <= (voxel_size / 2), voxel_dist_reward * 2, voxel_dist_reward)
     voxel_dist_reward = torch.where(d2voxel <= (voxel_size / 4), voxel_dist_reward * 2, voxel_dist_reward)
 
-    # regularization on the actions (summed for each environment). This is tho enable smooth movement.
-    action_penalty = torch.sum(actions ** 2, dim=-1)
+    # Penalize executed arm velocities as the smoothness term in the PCAP reward.
+    action_penalty = torch.sum(joint_velocities ** 2, dim=-1)
 
     # sum rewards but scale them first.
     voxel_rewards = dist_reward_scale * voxel_dist_reward - action_penalty_scale * action_penalty
