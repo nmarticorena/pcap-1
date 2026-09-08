@@ -666,13 +666,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             tree_start_pose = gymapi.Transform()
             if self.disable_trees:
                 tree_start_pose.p = gymapi.Vec3(100.0, 100.0, 0.0)
-                tree_start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
             else:
                 tree_start_pose.p = tree_start_position
-
+            
                 # make slight variation to the rot placement of the tree for Domain Randomisation
-                rand_quat = rl_helper.rand_rotate(original_quat=rep_tree_alignment_quats[i], rand_rot_limit_degree=5)
-                tree_start_pose.r = rand_quat
+            rand_quat = rl_helper.rand_rotate(original_quat=rep_tree_alignment_quats[i], rand_rot_limit_degree=5)
+            tree_start_pose.r = rand_quat
 
             # move around z-axis, the robot and the tree can collide depending on the angle.
             if self.test:
