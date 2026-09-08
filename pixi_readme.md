@@ -35,16 +35,16 @@ pixi run notebooks
 ## Train the robot
 To train the `franka` reaching version in sim run the following:
 ```
-pixi run bash pcap/source/reinforcement/ige/ige_task_runner.sh \                                    
-  task=Sim2RealFrankaTreeTactileVoxelReach \                                                        
-  num_envs=8192 \                                                                                   
-  headless=True \                                                                                   
-  capture_video=True \                                                                             
-  capture_video_freq=1500 \                                                                         
-  capture_video_len=100 \                                                                           
-  force_render=False \                                                     
+pixi run bash pcap/source/reinforcement/ige/ige_task_runner.sh \
+  task=Sim2RealFrankaTreeTactileVoxelReach \
+  num_envs=8192 \
+  headless=True \
+  capture_video=True \
+  capture_video_freq=1500 \
+  capture_video_len=100 \
+  force_render=False \
   wandb_project=franka_pcap \
-  wandb_entity=qcr_neural_fields              
+  wandb_entity=qcr_neural_fields
 ```
 
 
