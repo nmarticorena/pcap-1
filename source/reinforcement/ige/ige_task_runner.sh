@@ -1,5 +1,5 @@
-# Run custom isaacgymenvs tasks by copying it to the original repository.
 #!/bin/bash
+# Run custom PCAP tasks registered in the local IsaacGymEnvs checkout.
 
 set -e
 
@@ -36,24 +36,12 @@ task_name="$camel_case_task"
 if [ -z "$isaacgymenvs_path" ]
 then
   echo "Please set isaacgymenvs_path first. Refer readme.cmd"
-  exit 0
+  exit 1
 else
   echo "isaacgymenvs_path = $isaacgymenvs_path"
 fi
 
-echo "Installing custom isaacgymenvs RL packages to $isaacgymenvs_path"
-
-echo "removing task files from $isaacgymenvs_path ..... "
-
-rm -f $isaacgymenvs_path/tasks/$snake_case_task.py
-rm -f $isaacgymenvs_path/cfg/task/$camel_case_task.yaml
-rm -f $isaacgymenvs_path/cfg/train/${camel_case_task}PPO.yaml
-
-echo "copying task files ...."
-yes | cp -f $spot_path/source/reinforcement/ige/tasks/$snake_case_task.py $isaacgymenvs_path/tasks/
-yes | cp -f $spot_path/source/reinforcement/ige/cfg/task/$camel_case_task.yaml $isaacgymenvs_path/cfg/task/
-yes | cp -f $spot_path/source/reinforcement/ige/cfg/train/${camel_case_task}PPO.yaml $isaacgymenvs_path/cfg/train/
-echo "Copy Code: $? - Successful"
+echo "Using registered PCAP task from $spot_path/source/reinforcement/ige"
 
 # Take a backup of all relevant task files.
 curr_timestamp=$(date +"%Y-%m-%d-%H-%M-%S")
@@ -69,12 +57,12 @@ done
 
 if [ "$is_test" == "false" ]; then
     task_backup_folder="$spot_path/notebooks/work2/data/tactile/simulation/rl/tasks/task_train_$curr_timestamp"
-    mkdir "$task_backup_folder"
+    mkdir -p "$task_backup_folder"
     echo "Task Backup Folder created: $task_backup_folder"
 
-    cp -f $spot_path/source/reinforcement/ige/tasks/$snake_case_task.py $task_backup_folder/
-    cp -f $spot_path/source/reinforcement/ige/cfg/task/$camel_case_task.yaml $task_backup_folder/
-    cp -f $spot_path/source/reinforcement/ige/cfg/train/${camel_case_task}PPO.yaml $task_backup_folder/
+    cp -f "$spot_path/source/reinforcement/ige/tasks/$snake_case_task.py" "$task_backup_folder/"
+    cp -f "$spot_path/source/reinforcement/ige/cfg/task/$camel_case_task.yaml" "$task_backup_folder/"
+    cp -f "$spot_path/source/reinforcement/ige/cfg/train/${camel_case_task}PPO.yaml" "$task_backup_folder/"
 fi
 
 # Define the file to search in
@@ -110,7 +98,7 @@ if [[ "$arg" == *"checkpoint="* ]]; then
 done
 
 
-runs_dir="runs"
+runs_dir="$PIXI_PROJECT_ROOT/runs"
 
 # Check if the directory exists
 if [ -d "$runs_dir" ] && [ "$latest_folder_flag" = true ]; then
@@ -138,4 +126,5 @@ fi
 
 # pass arguments to the script as is to the python train script.
 echo "$final_command"
+cd "$PIXI_PROJECT_ROOT"
 eval "$final_command"
