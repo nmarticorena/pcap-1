@@ -19,5 +19,5 @@ class Sim2RealFrankaTreeTactileVoxelReach(Sim2RealKinovaTreeTactileVoxelReach):
     right_finger_body_name = "panda_rightfinger"
     flip_visual_attachments = True
     arm_type = ArmType.franka
-    max_norm_impact_cf = 2000
+    max_norm_impact_cf = 800.0
     supports_real = False
