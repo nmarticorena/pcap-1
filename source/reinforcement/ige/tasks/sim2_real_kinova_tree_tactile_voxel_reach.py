@@ -148,6 +148,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.action_penalty_scale = self.cfg["env"]["actionPenaltyScale"]
         self.collision_reward_scale = self.cfg["env"]["collisionRewardScale"]
         self.disable_trees = self.cfg["env"]["disableTrees"]
+        print(self.disable_trees)
+        print("#"* 200 )
 
         self.up_axis = "z"
         self.up_axis_idx = 2
@@ -667,7 +669,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
             tree_start_pose = gymapi.Transform()
             if self.disable_trees:
-                tree_start_pose.p = gymapi.Vec3(100.0, 100.0, 0.0)
+                tree_start_pose.p = gymapi.Vec3(10.0, 10.0, 5.0)
             else:
                 tree_start_pose.p = tree_start_position
             
