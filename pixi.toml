@@ -10,9 +10,9 @@ notebooks = {description = "Run Jupyter notebooks", cmd = "jupyter lab" , cwd = 
 
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-spot_path = "$PIXI_PROJECT_ROOT/pcap"
+spot_path = "$PIXI_PROJECT_ROOT"
 isaacgymenvs_path = "$PIXI_PROJECT_ROOT/isaacgymenvs/isaacgymenvs"
-PYTHONPATH = "$PIXI_PROJECT_ROOT/pcap/source${PYTHONPATH:+:$PYTHONPATH}"
+PYTHONPATH = "$PIXI_PROJECT_ROOT/source${PYTHONPATH:+:$PYTHONPATH}"
 
 [dependencies]
 python = "3.8.*"
@@ -22,6 +22,7 @@ psutil = "==5.9.0"
 matplotlib = ">=3.7.3,<4"
 configargparse = ">=1.7,<2"
 nbstripout = ">=0.8.2,<0.9"
+wandb = ">=0.16.6,<0.17"
 
 [pypi-dependencies]
 isaacgym = {path = "isaacgym/python", editable = true}
