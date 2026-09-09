@@ -24,6 +24,7 @@ env:
   openRewardScale: 7.5
   fingerDistRewardScale: 5.0
   actionPenaltyScale: 0.01
+  measuredVelocitySanityFactor: 10.0
   collisionRewardScale: 0.01
   disableTrees: False
 

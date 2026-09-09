@@ -146,6 +146,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.open_reward_scale = self.cfg["env"]["openRewardScale"]
         self.finger_dist_reward_scale = self.cfg["env"]["fingerDistRewardScale"]
         self.action_penalty_scale = self.cfg["env"]["actionPenaltyScale"]
+        self.measured_velocity_sanity_factor = self.cfg["env"].get("measuredVelocitySanityFactor", 10.0)
         self.collision_reward_scale = self.cfg["env"]["collisionRewardScale"]
         self.disable_trees = self.cfg["env"]["disableTrees"]
         print(self.disable_trees)
@@ -230,6 +231,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.train_episodes = 0
         self.report_successes = 0
         self.report_episodes = 0
+        self.max_measured_velocity_observed = torch.tensor(0.0, device=self.device)
 
         if self._arg_monitor_metric:
             assert (self.test or self.real), "no monitors during training."
@@ -328,6 +330,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # take a backup to use during resets.
         self.tree_default_dof_state = self.tree_dof_state.detach().clone()
+        self.tree_default_dof_state[..., 1] = 0
 
         # capture contact force/succ  metric to store during tests.
         if self.test:
@@ -924,8 +927,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # The buffers are looked up by the .base.vec_task.py to do the PPO
 
         (self.rew_buf[:], self.reset_buf[:], is_real_succ, is_test_succ, target_distance,
-         distance_reward, velocity_penalty) = compute_robot_reward(
+         distance_reward, velocity_penalty, invalid_velocity) = compute_robot_reward(
             self.reset_buf, self.progress_buf, self.robot_dof_vel[:, :self.num_policy_dofs],
+            self.robot_dof_vel_max_limits[:self.num_policy_dofs], self.measured_velocity_sanity_factor,
             self.robot_grasp_pos, self.dist_reward_scale,
             self.action_penalty_scale, self.max_episode_length, self.voxel_pos, self.robot_net_cf,
             self.collision_reward_scale, self.num_envs, self.collision_penalty_type, self.voxel_size,
@@ -933,7 +937,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         if not self.test and not self.real:
             reached_target = target_distance < self.voxel_size / 2
+            reached_target &= ~invalid_velocity
             self.episode_success |= reached_target
+            self.episode_success[invalid_velocity] = False
 
             # These summarize every active environment, so they are not biased toward
             # short successful episodes in the way completed-episode returns can be.
@@ -942,6 +948,18 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.extras["reward/distance_component_mean"] = distance_reward.mean()
             self.extras["reward/velocity_penalty_mean"] = velocity_penalty.mean()
             self.extras["reward/positive_fraction"] = (self.rew_buf > 0).float().mean()
+            self.extras["simulation/invalid_velocity_fraction"] = invalid_velocity.float().mean()
+            policy_velocity = self.robot_dof_vel[:, :self.num_policy_dofs]
+            finite_velocity = torch.where(torch.isfinite(policy_velocity), policy_velocity.abs(),
+                                          torch.zeros_like(policy_velocity))
+            max_measured_velocity = finite_velocity.max()
+            self.max_measured_velocity_observed = torch.maximum(self.max_measured_velocity_observed,
+                                                                max_measured_velocity)
+            self.extras["simulation/max_measured_velocity"] = max_measured_velocity
+            self.extras["simulation/max_measured_velocity_observed"] = self.max_measured_velocity_observed
+            if invalid_velocity.any():
+                self.sim_instability_resets += int(invalid_velocity.sum().item())
+            self.extras["simulation/instability_resets"] = self.sim_instability_resets
             self.extras["target_distance/mean"] = target_distance.mean()
             self.extras["target_distance/std"] = target_distance.std(unbiased=False)
             self.extras["target_distance/max"] = target_distance.max()
@@ -992,19 +1010,20 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             rki.shutdown_kinova_service()
             raise ValueError("Success: Real Target reached exiting ..... ")
 
-    def check_for_nans(self, **obs_components):
-        nan_row_env_ids = torch.Tensor([]).to(torch.int64).to(self.device)
+    def check_for_invalid_values(self, **obs_components):
+        invalid_row_env_ids = torch.empty(0, dtype=torch.int64, device=self.device)
 
         for c_name, c in obs_components.items():
-            if torch.any(torch.isnan(c)):
-                c_nan_indices = torch.where(torch.isnan(c).any(dim=1))[0]
-                print(f"{c_name}: tensor contains NaN values at envs: {c_nan_indices}")
-                nan_row_env_ids = torch.cat((nan_row_env_ids, c_nan_indices))
+            invalid_values = ~torch.isfinite(c)
+            if invalid_values.any():
+                invalid_indices = torch.where(invalid_values.flatten(start_dim=1).any(dim=1))[0]
+                print(f"{c_name}: tensor contains non-finite values at envs: {invalid_indices}")
+                invalid_row_env_ids = torch.cat((invalid_row_env_ids, invalid_indices))
 
-        nan_row_env_ids = nan_row_env_ids.unique()
-        if nan_row_env_ids.numel() > 0:
-            print(f"Combined unique row indices: {nan_row_env_ids}")
-        return nan_row_env_ids
+        invalid_row_env_ids = invalid_row_env_ids.unique()
+        if invalid_row_env_ids.numel() > 0:
+            print(f"Combined unique row indices: {invalid_row_env_ids}")
+        return invalid_row_env_ids
 
     def compute_tactile_obs(self):
         frame_no = self.gym.get_frame_count(self.sim)
@@ -1152,12 +1171,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.robot_dof_vel_targets[:, self.num_policy_dofs:self.num_robot_dofs] = 0
 
         # This logic is to reset the environments which returns nan.
-        nan_row_env_ids = self.check_for_nans(robot_dof_pos=self.robot_dof_pos,
-                                              branch_poses=self.branch_poses,
-                                              robot_dof_vel=self.robot_dof_vel)
+        nan_row_env_ids = self.check_for_invalid_values(robot_dof_pos=self.robot_dof_pos,
+                                                       branch_poses=self.branch_poses,
+                                                       robot_dof_vel=self.robot_dof_vel)
         while nan_row_env_ids.numel() > 0:
             self.reset_idx(nan_row_env_ids)
-            self.sim_instability_resets += nan_row_env_ids.numel()
+            self.sim_instability_resets += int(nan_row_env_ids.numel())
             print("resetting envs:", nan_row_env_ids)
 
             for i in range(10):
@@ -1166,9 +1185,9 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
                 self.gym.simulate(self.sim)
                 self.refresh_all_sim_tensors()
 
-                nan_row_env_ids = self.check_for_nans(robot_dof_pos=self.robot_dof_pos,
-                                                      branch_poses=self.branch_poses,
-                                                      robot_dof_vel=self.robot_dof_vel)
+                nan_row_env_ids = self.check_for_invalid_values(robot_dof_pos=self.robot_dof_pos,
+                                                                branch_poses=self.branch_poses,
+                                                                robot_dof_vel=self.robot_dof_vel)
 
                 if nan_row_env_ids.numel() == 0:
                     break
@@ -1295,14 +1314,15 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             _net_cf_mag = torch.norm(self.robot_net_cf.view(self.num_envs, -1), p=2, dim=1).item()  # verified
             self.net_cf_abs_sum_by_frame[-1].append(_net_cf_mag)
 
-            # Check if any value is NaN
-        if torch.any(torch.isnan(self.obs_buf)):
-            print("===== Error: The obs_buf tensor contains NaN values. =====")
+            # Check if any value is non-finite.
+        if not torch.isfinite(self.obs_buf).all():
+            print("===== Error: The obs_buf tensor contains non-finite values. =====")
             print("robot_dof_pos >> ", self.robot_dof_pos, )
-            self.check_for_nans(hand_pos=hand_pos, robot_dof_pos=self.robot_dof_pos, branch_poses=self.branch_poses,
-                                robot_grasp_pos=self.robot_grasp_pos, to_voxel_target=to_voxel_target,
-                                dof_pos_scaled=dof_pos_scaled, robot_dof_vel=self.robot_dof_vel)
-            raise ValueError("The tensor contains NaN values.")
+            self.check_for_invalid_values(hand_pos=hand_pos, robot_dof_pos=self.robot_dof_pos,
+                                          branch_poses=self.branch_poses, robot_grasp_pos=self.robot_grasp_pos,
+                                          to_voxel_target=to_voxel_target, dof_pos_scaled=dof_pos_scaled,
+                                          robot_dof_vel=self.robot_dof_vel)
+            raise ValueError("The tensor contains non-finite values.")
 
         return self.obs_buf
 
@@ -1476,6 +1496,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.reset_buf[env_ids] = 0
 
     def pre_physics_step(self, actions):
+        if not self.real:
+            reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+            if len(reset_env_ids) > 0:
+                self.reset_idx(reset_env_ids)
+
         # TODO: move this to conf and the validation outside instead of doing each time.
         real_write_freq = 60.  # frequency to write, in kinova this is close to 100Hz
         real_write_delay = 1.0 / real_write_freq
@@ -1618,10 +1643,6 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         # This is a tensor of size [num_envs]
         self.progress_buf += 1
-        env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-
-        if len(env_ids) > 0:
-            self.reset_idx(env_ids)
 
         if self.real:
             # invoke in case of test with real arm
@@ -1641,11 +1662,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 # noinspection PyTypeChecker
 @torch.jit.script
 def compute_robot_reward(
-        reset_buf, progress_buf, joint_velocities, robot_grasp_pos, dist_reward_scale, action_penalty_scale,
+        reset_buf, progress_buf, joint_velocities, joint_velocity_limits, velocity_sanity_factor,
+        robot_grasp_pos, dist_reward_scale, action_penalty_scale,
         max_episode_length, voxel_pos, robot_net_cf, collision_reward_scale, num_envs, collision_penalty_type,
         voxel_size, is_test, is_real, pred_collision_prob, non_subst_collisions_yn, rupture_collisions_yn
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
     d2voxel = torch.norm(robot_grasp_pos - voxel_pos, p=2, dim=-1)
 
@@ -1662,8 +1684,17 @@ def compute_robot_reward(
     voxel_dist_reward = torch.where(d2voxel <= (voxel_size / 2), voxel_dist_reward * 2, voxel_dist_reward)
     voxel_dist_reward = torch.where(d2voxel <= (voxel_size / 4), voxel_dist_reward * 2, voxel_dist_reward)
 
+    # Velocity targets are bounded, but invalid PhysX contact states can still
+    # produce enormous measured velocities. Quarantine those rows before the
+    # square turns a simulation failure into an unbounded PPO target.
+    finite_velocity = torch.isfinite(joint_velocities).all(dim=-1)
+    plausible_velocity = (joint_velocities.abs() <= joint_velocity_limits * velocity_sanity_factor).all(dim=-1)
+    invalid_velocity = ~(finite_velocity & plausible_velocity)
+    safe_joint_velocities = torch.where(invalid_velocity.unsqueeze(-1), torch.zeros_like(joint_velocities),
+                                        joint_velocities)
+
     # Penalize executed arm velocities as the smoothness term in the PCAP reward.
-    action_penalty = torch.sum(joint_velocities ** 2, dim=-1)
+    action_penalty = torch.sum(safe_joint_velocities ** 2, dim=-1)
 
     # sum rewards but scale them first.
     distance_reward = dist_reward_scale * voxel_dist_reward
@@ -1709,8 +1740,12 @@ def compute_robot_reward(
         reset_buf = torch.where(resettable_coll_impact > resettable_norm_impact_cf,
                                 torch.ones_like(reset_buf), reset_buf)
 
+    if not is_real:
+        voxel_rewards = torch.where(invalid_velocity, torch.full_like(voxel_rewards, -1.2), voxel_rewards)
+        reset_buf = torch.where(invalid_velocity, torch.ones_like(reset_buf), reset_buf)
+
     return (voxel_rewards, reset_buf, is_real_succ, is_test_succ, d2voxel,
-            distance_reward, velocity_penalty)
+            distance_reward, velocity_penalty, invalid_velocity)
 
 
 # PyTorch's Just-In-Time (JIT) compilation for improved performance.
