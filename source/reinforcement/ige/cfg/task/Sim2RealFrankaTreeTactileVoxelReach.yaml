@@ -6,6 +6,7 @@ env:
   numEnvs: ${resolve_default:2048,${...num_envs}}
   envSpacing: 1.5
   episodeLength: 800
+  successDistance: 0.05
 
   clipObservations: 5.0
   clipActions: 1.0
@@ -43,6 +44,7 @@ env:
   numEvaluationTargets: 60
   brushPastNormContactForce: 40
   contactForceNoiseStd: 1.0
+  enableGroundPlane: False
   transferableToReal: False
   dynamicsByBeamDeflection: False
   randomiseRobotStartPose: False

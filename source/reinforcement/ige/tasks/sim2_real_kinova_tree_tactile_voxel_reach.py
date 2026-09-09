@@ -132,6 +132,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.real_coll_prob_thresh = 0.4  # threshold beyond which an interaction is classified as collision.
 
         self.max_episode_length = self.cfg["env"]["episodeLength"]
+        self.success_distance = self.cfg["env"].get("successDistance", 0.05)
 
         self.action_scale = self.cfg["env"]["actionScale"]
         self.start_position_noise = self.cfg["env"]["startPositionNoise"]
@@ -176,6 +177,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         self.num_eval_targets = self.cfg["env"].get("numEvaluationTargets", 60)
         self.brush_past_norm_cf = self.cfg["env"]["brushPastNormContactForce"]
         self.contact_force_noise_std = self.cfg["env"].get("contactForceNoiseStd", 1.0)
+        self.enable_ground_plane = self.cfg["env"].get("enableGroundPlane", True)
         self.transferable_to_real = self.cfg["env"]["transferableToReal"]
         self.dynamics_by_beam_deflection = self.cfg["env"]["dynamicsByBeamDeflection"]
         self.randomise_robot_start_pose = self.cfg["env"]["randomiseRobotStartPose"]
@@ -349,6 +351,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
     def validate_settings(self):
 
+        assert self.success_distance > 0, "successDistance must be positive"
+
         if self.real and not self.supports_real:
             raise ValueError(f"Real execution is not implemented for {self.robot_name}")
 
@@ -399,7 +403,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
 
         #  call functions below
-        self._create_ground_plane()
+        if self.enable_ground_plane:
+            self._create_ground_plane()
 
         tree_start_position = gymapi.Vec3(0.0, 0.0, 0.0)
 
@@ -933,10 +938,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.robot_grasp_pos, self.dist_reward_scale,
             self.action_penalty_scale, self.max_episode_length, self.voxel_pos, self.robot_net_cf,
             self.collision_reward_scale, self.num_envs, self.collision_penalty_type, self.voxel_size,
-            self.test, self.real, self.pred_collision_prob, self.non_subst_collisions_yn, self.rupture_collisions_yn)
+            self.success_distance, self.test, self.real, self.pred_collision_prob,
+            self.non_subst_collisions_yn, self.rupture_collisions_yn)
 
         if not self.test and not self.real:
-            reached_target = target_distance < self.voxel_size / 2
+            reached_target = target_distance < self.success_distance
             reached_target &= ~invalid_velocity
             self.episode_success |= reached_target
             self.episode_success[invalid_velocity] = False
@@ -1665,15 +1671,16 @@ def compute_robot_reward(
         reset_buf, progress_buf, joint_velocities, joint_velocity_limits, velocity_sanity_factor,
         robot_grasp_pos, dist_reward_scale, action_penalty_scale,
         max_episode_length, voxel_pos, robot_net_cf, collision_reward_scale, num_envs, collision_penalty_type,
-        voxel_size, is_test, is_real, pred_collision_prob, non_subst_collisions_yn, rupture_collisions_yn
+        voxel_size, success_distance, is_test, is_real, pred_collision_prob,
+        non_subst_collisions_yn, rupture_collisions_yn
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
     d2voxel = torch.norm(robot_grasp_pos - voxel_pos, p=2, dim=-1)
 
     # boolean indicating if target reached in case of real executing.
-    is_real_succ = (d2voxel < voxel_size).all() if is_real else torch.tensor([False])
-    is_test_succ = (d2voxel < voxel_size).all() if is_test else torch.tensor([False])
+    is_real_succ = (d2voxel < success_distance).all() if is_real else torch.tensor([False])
+    is_test_succ = (d2voxel < success_distance).all() if is_test else torch.tensor([False])
 
     # compute voxel distance rewards.
     voxel_dist_reward = 1.0 / (1.0 + d2voxel ** 2)
@@ -1728,7 +1735,7 @@ def compute_robot_reward(
     else:
         raise ValueError("Not implemented.")
 
-    if not (is_test or is_real):  # during test use only max episode length for reset
+    if not (is_test or is_real):
         reset_buf = torch.where(d2voxel < (voxel_size / 2), torch.ones_like(reset_buf), reset_buf)
 
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
