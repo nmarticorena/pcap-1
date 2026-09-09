@@ -222,6 +222,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.loaded_classifier_model = None
 
         self.episode_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.latest_episode_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.completed_episode_once = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.train_successes = 0
         self.train_episodes = 0
         self.report_successes = 0
@@ -919,7 +921,8 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # The rewards are reset buffers are set once the RL environment computes it.
         # The buffers are looked up by the .base.vec_task.py to do the PPO
 
-        self.rew_buf[:], self.reset_buf[:], is_real_succ, is_test_succ = compute_robot_reward(
+        (self.rew_buf[:], self.reset_buf[:], is_real_succ, is_test_succ, target_distance,
+         distance_reward, velocity_penalty) = compute_robot_reward(
             self.reset_buf, self.progress_buf, self.robot_dof_vel[:, :self.num_policy_dofs],
             self.robot_grasp_pos, self.dist_reward_scale,
             self.action_penalty_scale, self.max_episode_length, self.voxel_pos, self.robot_net_cf,
@@ -927,20 +930,43 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.test, self.real, self.pred_collision_prob, self.non_subst_collisions_yn, self.rupture_collisions_yn)
 
         if not self.test and not self.real:
-            reached_target = torch.norm(self.robot_grasp_pos - self.voxel_pos, p=2, dim=-1) < self.voxel_size / 2
+            reached_target = target_distance < self.voxel_size / 2
             self.episode_success |= reached_target
+
+            # These summarize every active environment, so they are not biased toward
+            # short successful episodes in the way completed-episode returns can be.
+            self.extras["reward/step_mean"] = self.rew_buf.mean()
+            self.extras["reward/step_std"] = self.rew_buf.std(unbiased=False)
+            self.extras["reward/distance_component_mean"] = distance_reward.mean()
+            self.extras["reward/velocity_penalty_mean"] = velocity_penalty.mean()
+            self.extras["reward/positive_fraction"] = (self.rew_buf > 0).float().mean()
+            self.extras["target_distance/mean"] = target_distance.mean()
+            self.extras["target_distance/std"] = target_distance.std(unbiased=False)
+            self.extras["target_distance/max"] = target_distance.max()
+            self.extras["target_distance/within_success_threshold"] = reached_target.float().mean()
+
             finished = self.reset_buf.bool()
             if finished.any():
                 completed_episodes = int(finished.sum().item())
-                completed_successes = int(self.episode_success[finished].sum().item())
+                finished_success = self.episode_success[finished]
+                completed_successes = int(finished_success.sum().item())
                 self.train_episodes += completed_episodes
                 self.train_successes += completed_successes
                 self.report_episodes += completed_episodes
                 self.report_successes += completed_successes
+                self.latest_episode_success[finished] = finished_success
+                self.completed_episode_once[finished] = True
                 self.episode_success[finished] = False
 
                 cumulative_sr = self.train_successes / self.train_episodes
-                self.extras["success_rate"] = torch.tensor(cumulative_sr, device=self.device)
+                completion_coverage = self.completed_episode_once.float().mean()
+                self.extras["success_rate/completed_episode"] = torch.tensor(cumulative_sr, device=self.device)
+                self.extras["success_rate/completion_coverage"] = completion_coverage
+
+                # Give every environment one vote and wait until failures have had
+                # enough time to complete before publishing the headline SR.
+                if self.completed_episode_once.all():
+                    self.extras["success_rate"] = self.latest_episode_success.float().mean()
 
                 if self.report_episodes >= self.num_envs:
                     interval_sr = self.report_successes / self.report_episodes
@@ -1617,7 +1643,7 @@ def compute_robot_reward(
         max_episode_length, voxel_pos, robot_net_cf, collision_reward_scale, num_envs, collision_penalty_type,
         voxel_size, is_test, is_real, pred_collision_prob, non_subst_collisions_yn, rupture_collisions_yn
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
     d2voxel = torch.norm(robot_grasp_pos - voxel_pos, p=2, dim=-1)
 
@@ -1638,7 +1664,9 @@ def compute_robot_reward(
     action_penalty = torch.sum(joint_velocities ** 2, dim=-1)
 
     # sum rewards but scale them first.
-    voxel_rewards = dist_reward_scale * voxel_dist_reward - action_penalty_scale * action_penalty
+    distance_reward = dist_reward_scale * voxel_dist_reward
+    velocity_penalty = action_penalty_scale * action_penalty
+    voxel_rewards = distance_reward - velocity_penalty
 
     if collision_penalty_type == CollisionPenalty.NO_PENALTY:
         pass
@@ -1679,7 +1707,8 @@ def compute_robot_reward(
         reset_buf = torch.where(resettable_coll_impact > resettable_norm_impact_cf,
                                 torch.ones_like(reset_buf), reset_buf)
 
-    return voxel_rewards, reset_buf, is_real_succ, is_test_succ
+    return (voxel_rewards, reset_buf, is_real_succ, is_test_succ, d2voxel,
+            distance_reward, velocity_penalty)
 
 
 # PyTorch's Just-In-Time (JIT) compilation for improved performance.
