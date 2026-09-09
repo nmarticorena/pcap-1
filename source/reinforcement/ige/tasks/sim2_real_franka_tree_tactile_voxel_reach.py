@@ -9,7 +9,8 @@ class Sim2RealFrankaTreeTactileVoxelReach(Sim2RealKinovaTreeTactileVoxelReach):
     robot_name = "franka"
     robot_asset_key = "assetFileNameFranka"
     num_policy_dofs = 7
-    robot_default_dof_values = [1.157, -1.066, -0.155, -2.239, -1.841, 1.003, 0.469, 0.035, 0.035]
+    #robot_default_dof_values = [1.157, -1.066, 0, -2.239, -1.841, 1.003, 0.469, 0.035, 0.035]
+    robot_default_dof_values =[0., -0.3,  0., -2.2,  0.,2., 0.78539816, 0.035, 0.035]
     robot_cont_dof_indices = []
     robot_dof_damping_values = [80, 80, 80, 80, 80, 80, 80, 100, 100]
     robot_dof_friction_values = [1e-2] * 9
