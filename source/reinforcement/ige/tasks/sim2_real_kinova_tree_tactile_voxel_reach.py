@@ -931,11 +931,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
         # The buffers are looked up by the .base.vec_task.py to do the PPO
 
         (self.rew_buf[:], self.reset_buf[:], is_real_succ, is_test_succ, target_distance,
-         distance_reward, action_penalty, invalid_velocity) = compute_robot_reward(
+         distance_reward, velocity_penalty, invalid_velocity) = compute_robot_reward(
             self.reset_buf, self.progress_buf, self.robot_dof_vel[:, :self.num_policy_dofs],
             self.robot_dof_vel_max_limits[:self.num_policy_dofs], self.measured_velocity_sanity_factor,
-            actions, self.robot_grasp_pos, self.dist_reward_scale,
-            self.action_penalty_scale, self.max_episode_length, self.voxel_pos, self.robot_net_cf,
+            self.robot_grasp_pos, self.dist_reward_scale, self.action_penalty_scale,
+            self.max_episode_length, self.voxel_pos, self.robot_net_cf,
             self.collision_reward_scale, self.num_envs, self.collision_penalty_type, self.voxel_size,
             self.success_distance, self.test, self.real, self.pred_collision_prob,
             self.non_subst_collisions_yn, self.rupture_collisions_yn)
@@ -951,7 +951,7 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
             self.extras["reward/step_mean"] = self.rew_buf.mean()
             self.extras["reward/step_std"] = self.rew_buf.std(unbiased=False)
             self.extras["reward/distance_component_mean"] = distance_reward.mean()
-            self.extras["reward/action_penalty_mean"] = action_penalty.mean()
+            self.extras["reward/velocity_penalty_mean"] = velocity_penalty.mean()
             self.extras["reward/positive_fraction"] = (self.rew_buf > 0).float().mean()
             self.extras["simulation/invalid_velocity_fraction"] = invalid_velocity.float().mean()
             policy_velocity = self.robot_dof_vel[:, :self.num_policy_dofs]
@@ -1498,9 +1498,11 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
     def pre_physics_step(self, actions):
         if not self.real:
+            # Completed environments were already reset in post_physics_step so
+            # the policy received their initial observations alongside done=1.
             reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
-            if len(reset_env_ids) > 0:
-                self.reset_idx(reset_env_ids)
+            self.progress_buf[reset_env_ids] = 0
+            self.reset_buf[reset_env_ids] = 0
 
         # TODO: move this to conf and the validation outside instead of doing each time.
         real_write_freq = 60.  # frequency to write, in kinova this is close to 100Hz
@@ -1654,6 +1656,17 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 
         self.compute_reward(self.actions)
 
+        if not self.real:
+            reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+            if len(reset_env_ids) > 0:
+                terminal_progress = self.progress_buf[reset_env_ids].clone()
+                self.reset_idx(reset_env_ids)
+                self.compute_sim_observations()
+                # Return done=1 with the reset observation. It is cleared at the
+                # beginning of the next pre_physics_step without another reset.
+                self.progress_buf[reset_env_ids] = terminal_progress
+                self.reset_buf[reset_env_ids] = 1
+
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -1664,12 +1677,12 @@ class Sim2RealKinovaTreeTactileVoxelReach(VecTask):
 @torch.jit.script
 def compute_robot_reward(
         reset_buf, progress_buf, joint_velocities, joint_velocity_limits, velocity_sanity_factor,
-        actions, robot_grasp_pos, dist_reward_scale, action_penalty_scale,
+        robot_grasp_pos, dist_reward_scale, action_penalty_scale,
         max_episode_length, voxel_pos, robot_net_cf, collision_reward_scale, num_envs, collision_penalty_type,
         voxel_size, success_distance, is_test, is_real, pred_collision_prob,
         non_subst_collisions_yn, rupture_collisions_yn
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, float, Tensor, float, float, float, Tensor, Tensor, float, int, CollisionPenalty, float, float, bool, bool, Tensor, Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
     d2voxel = torch.norm(robot_grasp_pos - voxel_pos, p=2, dim=-1)
 
@@ -1692,14 +1705,17 @@ def compute_robot_reward(
     plausible_velocity = (joint_velocities.abs() <= joint_velocity_limits * velocity_sanity_factor).all(dim=-1)
     invalid_velocity = ~(finite_velocity & plausible_velocity)
 
-    # Actions are clipped by VecTask before this function is called, keeping the
-    # regularizer bounded independently of transient PhysX velocity spikes.
-    action_penalty = torch.sum(actions ** 2, dim=-1)
+    # Normalize by each joint's physical limit and clamp so transient PhysX
+    # spikes cannot create unbounded PPO targets.
+    safe_joint_velocities = torch.where(invalid_velocity.unsqueeze(-1), torch.zeros_like(joint_velocities),
+                                        joint_velocities)
+    normalized_joint_velocities = torch.clamp(safe_joint_velocities / joint_velocity_limits, -1.0, 1.0)
+    velocity_penalty = torch.sum(normalized_joint_velocities ** 2, dim=-1)
 
     # sum rewards but scale them first.
     distance_reward = dist_reward_scale * voxel_dist_reward
-    action_penalty = action_penalty_scale * action_penalty
-    voxel_rewards = distance_reward - action_penalty
+    velocity_penalty = action_penalty_scale * velocity_penalty
+    voxel_rewards = distance_reward - velocity_penalty
 
     if collision_penalty_type == CollisionPenalty.NO_PENALTY:
         pass
@@ -1728,9 +1744,6 @@ def compute_robot_reward(
     else:
         raise ValueError("Not implemented.")
 
-    if not (is_test or is_real):
-        reset_buf = torch.where(d2voxel < (voxel_size / 2), torch.ones_like(reset_buf), reset_buf)
-
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 
     if not (is_test or is_real):
@@ -1745,7 +1758,7 @@ def compute_robot_reward(
         reset_buf = torch.where(invalid_velocity, torch.ones_like(reset_buf), reset_buf)
 
     return (voxel_rewards, reset_buf, is_real_succ, is_test_succ, d2voxel,
-            distance_reward, action_penalty, invalid_velocity)
+            distance_reward, velocity_penalty, invalid_velocity)
 
 
 # PyTorch's Just-In-Time (JIT) compilation for improved performance.
