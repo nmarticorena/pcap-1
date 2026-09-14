@@ -43,7 +43,6 @@ env:
   enableEvalVoxelFile: False
   numEvaluationTargets: 60
   brushPastNormContactForce: 40
-  contactForceNoiseStd: 1.0
   enableGroundPlane: False
   transferableToReal: False
   dynamicsByBeamDeflection: False
