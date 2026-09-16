@@ -8,6 +8,43 @@ version = "0.1.0"
 [tasks]
 notebooks = {description = "Run Jupyter notebooks", cmd = "jupyter lab" , cwd = "pcap/notebooks"}
 
+[tasks.train]
+description = "Train an Isaac Gym task by its full task name"
+args = [
+  "task_name",
+  { arg = "wandb_project", default = "pcap" },
+  { arg = "wandb_entity", default = "qcr_neural_fields" },
+]
+cmd = "bash source/reinforcement/ige/ige_task_runner.sh task={{ task_name }} num_envs=8192 headless=True capture_video=False capture_video_freq=1500 capture_video_len=100 force_render=True wandb_project={{ wandb_project }} wandb_entity={{ wandb_entity }} wandb_activate=True"
+
+[tasks.train-franka]
+description = "Train the Franka reaching policy"
+args = [
+  { arg = "wandb_project", default = "franka_pcap" },
+  { arg = "wandb_entity", default = "qcr_neural_fields" },
+]
+depends-on = [
+  { task = "train", args = ["Sim2RealFrankaTreeTactileVoxelReach", "{{ wandb_project }}", "{{ wandb_entity }}"] },
+]
+
+[tasks.train-kinova]
+description = "Train the Kinova reaching policy"
+args = [
+  { arg = "wandb_project", default = "kinova_pcap" },
+  { arg = "wandb_entity", default = "qcr_neural_fields" },
+]
+depends-on = [
+  { task = "train", args = ["Sim2RealKinovaTreeTactileVoxelReach", "{{ wandb_project }}", "{{ wandb_entity }}"] },
+]
+
+[tasks.test-franka]
+description = "Test the latest Franka reaching-policy checkpoint"
+cmd = "bash source/reinforcement/ige/ige_task_runner.sh task=Sim2RealFrankaTreeTactileVoxelReach test=True num_envs=1 headless=True capture_video=False force_render=True wandb_activate=False"
+
+[tasks.test-kinova]
+description = "Test the latest Kinova reaching-policy checkpoint"
+cmd = "bash source/reinforcement/ige/ige_task_runner.sh task=Sim2RealKinovaTreeTactileVoxelReach test=True num_envs=1 headless=True capture_video=False force_render=True wandb_activate=False"
+
 [activation.env]
 LD_LIBRARY_PATH = "$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 spot_path = "$PIXI_PROJECT_ROOT"

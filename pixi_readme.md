@@ -33,19 +33,68 @@ pixi run notebooks
 ```
 
 ## Train the robot
-To train the `franka` reaching version in sim run the following:
+Train either reaching policy with the parameterized Pixi task:
+
+```bash
+pixi run train-franka
+pixi run train-kinova
 ```
-pixi run bash pcap/source/reinforcement/ige/ige_task_runner.sh \
+
+Both shortcuts delegate to the generic task, which accepts a full Isaac Gym
+task name:
+
+```bash
+pixi run train Sim2RealFrankaTreeTactileVoxelReach franka_pcap qcr_neural_fields
+```
+
+Training uses 8,192 environments and enables W&B. The W&B project defaults to
+`franka_pcap` or `kinova_pcap`, based on the selected robot, and the entity
+defaults to `qcr_neural_fields`. Override either value without editing the
+manifest:
+
+```bash
+pixi run train-franka my_project my_team
+```
+
+For `train-franka` and `train-kinova`, the optional arguments are ordered as
+`wandb_project` and `wandb_entity`. To change only the entity, repeat the
+default project, for example `pixi run train-kinova kinova_pcap my_team`.
+The generic `train` task takes `task_name` first and defaults its project to
+`pcap`. Additional Hydra overrides can be passed after `--`, for example:
+
+```bash
+pixi run train Sim2RealFrankaTreeTactileVoxelReach -- max_iterations=10
+```
+
+Test the latest checkpoint for a robot with:
+
+```bash
+pixi run test-franka
+pixi run test-kinova
+```
+
+The runner automatically selects the latest matching checkpoint. To select a
+checkpoint explicitly, or pass any other Hydra override, append it to the
+task:
+
+```bash
+pixi run test-kinova checkpoint=runs/<run>/nn/Sim2RealKinovaTreeTactileVoxelReach.pth
+pixi run test-kinova +real=True
+```
+
+The train task is equivalent to:
+
+```
+pixi run bash source/reinforcement/ige/ige_task_runner.sh \
   task=Sim2RealFrankaTreeTactileVoxelReach \
   num_envs=8192 \
   headless=True \
   capture_video=False \
+  capture_video_freq=1500 \
+  capture_video_len=100 \
+  force_render=True \
   wandb_project=franka_pcap \
-  wandb_entity=qcr_neural_fields
+  wandb_entity=qcr_neural_fields \
+  wandb_activate=True
 ```
-
-
-
-
-
 
