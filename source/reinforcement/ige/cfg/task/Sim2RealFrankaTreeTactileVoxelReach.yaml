@@ -43,7 +43,7 @@ env:
   enableEvalVoxelFile: False
   numEvaluationTargets: 60
   brushPastNormContactForce: 40
-  enableGroundPlane: False
+  enableGroundPlane: True
   transferableToReal: False
   dynamicsByBeamDeflection: False
   randomiseRobotStartPose: False
