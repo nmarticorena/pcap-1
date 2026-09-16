@@ -1,5 +1,7 @@
 runs/*
 isaacgym/*
+wandb/*
+notebooks/work2/data/tactile/simulation/rl
 # misc
 .DS_Store
 .env.local
