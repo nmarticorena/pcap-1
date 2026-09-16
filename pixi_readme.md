@@ -4,7 +4,7 @@ Meta repository to install all the dependencies of pcap
 ## Clone this repo
 
 ```
-git clone --recursive git@github.com:nmarticorena/pcap_experiments.git
+git clone --recursive git@github.com:nmarticorena/pcap-1.git
 ```
 
 ## Install IsaacGym
